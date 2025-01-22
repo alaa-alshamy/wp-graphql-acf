@@ -102,6 +102,7 @@ class Mutations
 
 	private function save_registered_fields_data( int $object_id, string $object_type, array $fields_data, array $registered_fields ): void
 	{
+		$acf_changed = false;
 		foreach ( $fields_data as $key => $value ) {
 			if ( ! empty( $registered_fields[$key] ) ) {
 				if ( ! empty( $registered_fields[$key]['sub_fields_config'] ) ) {
@@ -116,7 +117,15 @@ class Mutations
 				else {
 					$this->update_acf_field_value( $object_id, $object_type, $value, $registered_fields[$key] );
 				}
+				$acf_changed = true;
 			}
+		}
+
+		// We need this to let the revision code of ACF to work correctly.
+		// advanced-custom-fields-pro/includes/revisions.php
+		if ( $acf_changed && $object_type === self::POST_OBJECT_TYPE ) {
+			$_POST['_acf_changed'] = 1;
+			do_action( 'acf/save_post', $object_id );
 		}
 	}
 
