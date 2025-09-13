@@ -366,6 +366,16 @@ class Config {
 		return $str;
 	}
 
+	public static function convert_to_snake_case( string $str ): string {
+		// non-alpha and non-numeric characters become spaces.
+		$str = preg_replace( '/[^a-z0-9]+/i', ' ', $str );
+		$str = trim( $str );
+		// Lowercase the string.
+		$str = strtolower( $str );
+		// Replace spaces.
+		return str_replace( ' ', '_', $str );
+	}
+
 	/**
 	 * Undocumented function
 	 *
@@ -1522,7 +1532,7 @@ class Config {
 			// Loop over the choices in the field and add them to the enum values array.
 			foreach ( $acf_field['choices'] as $key => $choice ) {
 				// Use the sanitize_key function to create a valid enum name from the choice key.
-				$enum_key = strtoupper( sanitize_key( $key ) );
+				$enum_key = strtoupper( self::convert_to_snake_case( $key ) );
 
 				// Add the choice to the enum values array.
 				$enum_values[ $enum_key ] = [
