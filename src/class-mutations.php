@@ -105,6 +105,11 @@ class Mutations
 		$acf_changed = false;
 		foreach ( $fields_data as $key => $value ) {
 			if ( ! empty( $registered_fields[$key] ) ) {
+				// Control flags (e.g. a repeater's "<field>Append") are handled alongside
+				// their field, not saved as data of their own.
+				if ( ! empty( $registered_fields[$key]['is_append_flag'] ) ) {
+					continue;
+				}
 				if ( ! empty( $registered_fields[$key]['sub_fields_config'] ) ) {
 					$this->save_registered_fields_data( $object_id, $object_type, $value, $registered_fields[$key]['sub_fields_config'] );
 				}
@@ -112,7 +117,13 @@ class Mutations
 					! empty( $registered_fields[$key]['mutate'] )
 					&& is_callable( $registered_fields[$key]['mutate'] )
 				) {
-					call_user_func_array( $registered_fields[$key]['mutate'], [ $object_id, $object_type, $value, $registered_fields[$key] ] );
+					// Resolve the per-request append flag from the field's sibling control
+					// field, when one was registered (repeaters).
+					$append = false;
+					if ( ! empty( $registered_fields[$key]['append_flag_field'] ) ) {
+						$append = ! empty( $fields_data[ $registered_fields[$key]['append_flag_field'] ] );
+					}
+					call_user_func_array( $registered_fields[$key]['mutate'], [ $object_id, $object_type, $value, $registered_fields[$key], $append ] );
 				}
 				else {
 					$this->update_acf_field_value( $object_id, $object_type, $value, $registered_fields[$key] );
@@ -137,7 +148,7 @@ class Mutations
 	 *
 	 * @return array|null
 	 */
-	private function add_field_group_fields( array $field_group, string $parent_type_name, bool $layout = false ) {
+	private function add_field_group_fields( array $field_group, string $parent_type_name, bool $layout = false, bool $allow_append_flags = true ) {
 
 		/**
 		 * If the field group has the show_in_graphql setting configured, respect it's setting
@@ -212,8 +223,27 @@ class Mutations
 				'acf_field_group' => $field_group,
 			];
 
-			$field_config = $this->register_graphql_field( $config, $parent_type_name );
+			$field_config = $this->register_graphql_field( $config, $parent_type_name, $allow_append_flags );
 			if ( ! empty( $field_config ) ) {
+				// For repeaters, expose an optional sibling flag so a client can choose to
+				// append the provided rows to the existing ones instead of replacing them
+				// (default false). Kept as a separate Boolean field rather than folded into
+				// the repeater input so the repeater's shape is unchanged and existing
+				// queries keep working.
+				if ( $allow_append_flags && isset( $acf_field['type'] ) && 'repeater' === $acf_field['type'] ) {
+					$append_field_name                 = $name . 'Append';
+					$field_config['append_flag_field'] = $append_field_name;
+					$registered_fields[ $append_field_name ] = [
+						'type'           => 'Boolean',
+						'defaultValue'   => false,
+						'description'    => sprintf(
+							/* translators: %s: repeater field name. */
+							__( 'When true, append the provided "%s" rows to the existing rows instead of replacing them. Default false.', 'wp-graphql-acf' ),
+							$name
+						),
+						'is_append_flag' => true,
+					];
+				}
 				$registered_fields[$name] = $field_config;
 			}
 
@@ -252,7 +282,67 @@ class Mutations
 		return apply_filters( 'wpgraphql_acf_filter_mutation_field_value', $filtered_value, $acf_type, $original_value, $field_name, $field_config );
 	}
 
-	private function update_acf_field_value( int $object_id, string $object_type, $value, array $field_config, bool $use_add_row = false ) {
+	/**
+	 * Recursively translate a GraphQL input row into an ACF-keyed row.
+	 *
+	 * ACF matches a repeater/group sub-value by the sub-field's key or ACF (snake_case)
+	 * name, never by the GraphQL (camelCase) field name the input arrives with. Nested
+	 * repeaters and groups are re-keyed recursively here because a parent repeater saves
+	 * them wholesale rather than through their own mutate handler.
+	 */
+	private function normalize_acf_row( array $row, array $sub_fields_config ) {
+		$row_value = [];
+		foreach ( $row as $sub_field_key => $sub_field_value ) {
+			$sub_field_config = isset( $sub_fields_config[ $sub_field_key ] ) ? $sub_fields_config[ $sub_field_key ] : null;
+			// Skip unknown keys and non-field control entries (e.g. an "<field>Append" flag).
+			if ( empty( $sub_field_config ) || empty( $sub_field_config['acf_field'] ) ) {
+				continue;
+			}
+			$value = $this->normalize_acf_input( $sub_field_value, $sub_field_config );
+			if ( $value !== null ) {
+				$acf_key = $this->get_field_key( $sub_field_config['acf_field'] );
+				$row_value[ $acf_key ] = $value;
+			}
+		}
+		return $row_value;
+	}
+
+	/**
+	 * Normalize a single field value for saving: recurse into nested repeaters/groups so
+	 * their keys are translated too, otherwise run the leaf value through the filter.
+	 */
+	private function normalize_acf_input( $value, array $field_config ) {
+		// Nested repeater: a list of rows.
+		if ( ! empty( $field_config['repeater_sub_fields_config'] ) ) {
+			if ( ! is_array( $value ) ) {
+				return $value;
+			}
+			$rows = [];
+			foreach ( $value as $row ) {
+				if ( ! is_array( $row ) ) {
+					continue;
+				}
+				$normalized = $this->normalize_acf_row( $row, $field_config['repeater_sub_fields_config'] );
+				if ( ! empty( $normalized ) ) {
+					$rows[] = $normalized;
+				}
+			}
+			return $rows;
+		}
+
+		// Nested group: a single associative row.
+		if ( ! empty( $field_config['sub_fields_config'] ) ) {
+			if ( ! is_array( $value ) ) {
+				return $value;
+			}
+			return $this->normalize_acf_row( $value, $field_config['sub_fields_config'] );
+		}
+
+		// Leaf field: run it through the mutation value filter.
+		return $this->maybe_filter_value( $field_config, $value );
+	}
+
+	private function update_acf_field_value( int $object_id, string $object_type, $value, array $field_config, string $mode = 'update' ) {
 
 		switch ( $object_type ) {
 			case self::TERM_OBJECT_TYPE:
@@ -290,13 +380,33 @@ class Mutations
 
 		$value = $this->maybe_filter_value( $field_config, $value );
 
-		if ( $value !== null ) {
-			if ( $use_add_row ) {
+		if ( $value === null ) {
+			return;
+		}
+
+		switch ( $mode ) {
+			case 'add_row':
+				// Append a single row to the repeater's existing rows.
 				add_row( $key, $value, $object_id );
-			}
-			else {
+				break;
+			case 'replace_rows':
+				// Replace all of the repeater's rows with $value (an array of rows); an
+				// empty array clears it. Force ACF's non-paginated update path so the rows
+				// fully replace the existing ones. This mirrors ACF's own add_row(), which
+				// disables pagination before saving; without it a paginated repeater would
+				// append during acf/save_post instead of replacing.
+				$post_id = acf_get_valid_post_id( $object_id );
+				$field   = acf_maybe_get_field( $key, $post_id, false );
+				if ( ! $field ) {
+					update_field( $key, $value, $object_id );
+					break;
+				}
+				$field['pagination'] = false;
+				acf_update_value( is_array( $value ) ? $value : [], $post_id, $field );
+				break;
+			default:
 				update_field( $key, $value, $object_id );
-			}
+				break;
 		}
 	}
 
@@ -316,7 +426,7 @@ class Mutations
 	 *
 	 * @return array|null
 	 */
-	private function register_graphql_field( array $config, string $parent_type_name = '' ) {
+	private function register_graphql_field( array $config, string $parent_type_name = '', bool $allow_append_flags = true ) {
 		$acf_field = isset( $config['acf_field'] ) ? $config['acf_field'] : null;
 		$acf_type  = isset( $acf_field['type'] ) ? $acf_field['type'] : null;
 
@@ -428,7 +538,7 @@ class Mutations
 
 				$field_type_name = $this->prepare_input_type_name( $acf_field['name'], $parent_type_name );
 
-				$sub_fields_config = $this->add_field_group_fields( $acf_field, $field_type_name );
+				$sub_fields_config = $this->add_field_group_fields( $acf_field, $field_type_name, false, $allow_append_flags );
 
 				if ( ! empty( $sub_fields_config ) ) {
 					$this->type_registry->register_input_type(
@@ -449,7 +559,10 @@ class Mutations
 
 				$field_type_name = $this->prepare_input_type_name( $acf_field['name'], $parent_type_name );
 
-				$sub_fields_config = $this->add_field_group_fields( $acf_field, $field_type_name );
+				// A repeater's rows are saved wholesale (not field-by-field), so an append flag
+				// on a repeater nested in these rows could never be threaded to it. Disable flag
+				// registration for everything below to keep it out of the row input type.
+				$sub_fields_config = $this->add_field_group_fields( $acf_field, $field_type_name, false, false );
 
 				if ( ! empty( $sub_fields_config ) ) {
 					$this->type_registry->register_input_type(
@@ -463,27 +576,38 @@ class Mutations
 					$field_config = [
 						'type' => [ 'list_of' => $field_type_name ],
 						'repeater_sub_fields_config' => $sub_fields_config,
-						'mutate' => function( $object_id, $object_type, $rows, $field_config ) use ( $sub_fields_config ) {
-							if ( ! empty( $rows ) && is_array( $rows ) ) {
-								foreach ( $rows as $row ) {
-									$row_value = [];
-									foreach ( $row as $sub_field_key => $sub_field_value ) {
-										$sub_field_config = $sub_fields_config[$sub_field_key];
-										if ( ! empty( $sub_field_config ) ) {
-											$sub_field_value = $this->maybe_filter_value( $sub_field_config, $sub_field_value );
+						'mutate' => function( $object_id, $object_type, $rows, $field_config, $append = false ) use ( $sub_fields_config ) {
+							// A null/absent value is a no-op (an omitted field must never wipe existing
+							// rows); only an explicit list acts on the field. An empty list clears it.
+							if ( ! is_array( $rows ) ) {
+								return;
+							}
 
-											if ( $sub_field_value !== null ) {
-												$acf_key = $this->get_field_key( $sub_field_config['acf_field'] );
-												$row_value[$acf_key] = $sub_field_value;
-											}
-										}
-									}
-
-									if ( ! empty( $row_value ) ) {
-										$this->update_acf_field_value( $object_id, $object_type, $row_value, $field_config, true );
-									}
+							// Normalize each incoming row into an [ acf_field_key => value ] array, translating
+							// nested repeater/group keys recursively (see normalize_acf_row).
+							$normalized_rows = [];
+							foreach ( $rows as $row ) {
+								if ( ! is_array( $row ) ) {
+									continue;
+								}
+								$row_value = $this->normalize_acf_row( $row, $sub_fields_config );
+								if ( ! empty( $row_value ) ) {
+									$normalized_rows[] = $row_value;
 								}
 							}
+
+							// $append is the per-request "<field>Append" flag (default false => replace).
+							if ( $append ) {
+								// Legacy behaviour: append each provided row to the existing rows.
+								foreach ( $normalized_rows as $row_value ) {
+									$this->update_acf_field_value( $object_id, $object_type, $row_value, $field_config, 'add_row' );
+								}
+								return;
+							}
+
+							// Default behaviour: replace all existing rows with exactly the rows
+							// provided. An explicit empty list clears the repeater.
+							$this->update_acf_field_value( $object_id, $object_type, $normalized_rows, $field_config, 'replace_rows' );
 						},
 					];
 				}
